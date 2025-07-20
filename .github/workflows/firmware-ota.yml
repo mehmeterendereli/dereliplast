@@ -1,0 +1,263 @@
+name: Firmware OTA Release
+
+on:
+  push:
+    tags:
+      - 'v*'  # v1.0.0, v1.1.0 gibi taglar
+
+jobs:
+  build-firmware:
+    name: Build ESP32 Firmware
+    runs-on: ubuntu-latest
+    
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+        
+      - name: Cache PlatformIO
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio/.cache
+          key: ${{ runner.os }}-pio-${{ hashFiles('firmware/extruder80_156/platformio.ini') }}
+          
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+          
+      - name: Install PlatformIO Core
+        run: pip install --upgrade platformio
+        
+      - name: Update version in firmware
+        run: |
+          cd firmware/extruder80_156
+          sed -i 's/#define FIRMWARE_VERSION.*/#define FIRMWARE_VERSION "${{ steps.version.outputs.version }}"/' src/config.h
+          
+      - name: Build firmware (ESP32)
+        run: |
+          cd firmware/extruder80_156
+          pio run --environment esp32dev
+          
+      - name: Build firmware (ESP32-S3)
+        run: |
+          cd firmware/extruder80_156
+          pio run --environment esp32s3dev
+          
+      - name: Generate checksums
+        run: |
+          cd firmware/extruder80_156/.pio/build
+          sha256sum esp32dev/firmware.bin > esp32dev/firmware.bin.sha256
+          sha256sum esp32s3dev/firmware.bin > esp32s3dev/firmware.bin.sha256
+          
+      - name: Create OTA metadata
+        run: |
+          cat > ota_metadata.json << EOF
+          {
+            "version": "${{ steps.version.outputs.version }}",
+            "build_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "commit": "${{ github.sha }}",
+            "firmwares": {
+              "esp32": {
+                "file": "firmware_esp32_${{ steps.version.outputs.version }}.bin",
+                "checksum": "$(cat firmware/extruder80_156/.pio/build/esp32dev/firmware.bin.sha256 | cut -d' ' -f1)",
+                "size": $(stat -c%s firmware/extruder80_156/.pio/build/esp32dev/firmware.bin)
+              },
+              "esp32s3": {
+                "file": "firmware_esp32s3_${{ steps.version.outputs.version }}.bin", 
+                "checksum": "$(cat firmware/extruder80_156/.pio/build/esp32s3dev/firmware.bin.sha256 | cut -d' ' -f1)",
+                "size": $(stat -c%s firmware/extruder80_156/.pio/build/esp32s3dev/firmware.bin)
+              }
+            },
+            "changelog": "See release notes for detailed changes",
+            "min_required_version": "1.0.0",
+            "critical_update": false
+          }
+          EOF
+          
+      - name: Rename firmware files
+        run: |
+          mv firmware/extruder80_156/.pio/build/esp32dev/firmware.bin firmware_esp32_${{ steps.version.outputs.version }}.bin
+          mv firmware/extruder80_156/.pio/build/esp32s3dev/firmware.bin firmware_esp32s3_${{ steps.version.outputs.version }}.bin
+          
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: firmware-binaries
+          path: |
+            firmware_*.bin
+            ota_metadata.json
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build-firmware
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        
+      - name: Download firmware
+        uses: actions/download-artifact@v3
+        with:
+          name: firmware-binaries
+          
+      - name: Run security checks
+        run: |
+          # Check for hardcoded credentials
+          if grep -r "password\|secret\|key" firmware/extruder80_156/src/ --exclude-dir=.git; then
+            echo "⚠️  Potential hardcoded credentials found!"
+            exit 1
+          fi
+          
+          # Check firmware size
+          ESP32_SIZE=$(stat -c%s firmware_esp32_*.bin)
+          ESP32S3_SIZE=$(stat -c%s firmware_esp32s3_*.bin)
+          
+          if [ $ESP32_SIZE -gt 1572864 ]; then  # 1.5MB limit
+            echo "❌ ESP32 firmware too large: $ESP32_SIZE bytes"
+            exit 1
+          fi
+          
+          if [ $ESP32S3_SIZE -gt 1572864 ]; then
+            echo "❌ ESP32-S3 firmware too large: $ESP32S3_SIZE bytes"
+            exit 1
+          fi
+          
+          echo "✅ Security checks passed"
+
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [build-firmware, security-scan]
+    
+    permissions:
+      contents: write
+      
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        
+      - name: Download firmware
+        uses: actions/download-artifact@v3
+        with:
+          name: firmware-binaries
+          
+      - name: Generate changelog
+        id: changelog
+        run: |
+          if [ -f CHANGELOG.md ]; then
+            # Extract changelog for this version
+            awk '/^## \[?${{ needs.build-firmware.outputs.version }}\]?/{flag=1; next} /^## \[?[0-9]/{flag=0} flag' CHANGELOG.md > current_changelog.md
+          else
+            echo "Firmware sürümü ${{ needs.build-firmware.outputs.version }}" > current_changelog.md
+            echo "" >> current_changelog.md
+            echo "### Değişiklikler:" >> current_changelog.md
+            echo "- Yeni firmware sürümü" >> current_changelog.md
+          fi
+          
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ needs.build-firmware.outputs.version }}
+          name: Firmware v${{ needs.build-firmware.outputs.version }}
+          body_path: current_changelog.md
+          files: |
+            firmware_*.bin
+            ota_metadata.json
+          draft: false
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  update-ota-server:
+    name: Update OTA Server
+    runs-on: ubuntu-latest
+    needs: [build-firmware, create-release]
+    if: ${{ !contains(github.ref, 'alpha') && !contains(github.ref, 'beta') }}
+    
+    steps:
+      - name: Download firmware
+        uses: actions/download-artifact@v3
+        with:
+          name: firmware-binaries
+          
+      - name: Deploy to Firebase Storage
+        run: |
+          # Firebase CLI ile storage'a upload
+          npm install -g firebase-tools
+          
+          echo "${{ secrets.FIREBASE_SERVICE_ACCOUNT }}" > firebase-key.json
+          export GOOGLE_APPLICATION_CREDENTIALS=firebase-key.json
+          
+          # Upload firmware files
+          firebase storage:upload firmware_esp32_${{ needs.build-firmware.outputs.version }}.bin \
+            --bucket ${{ secrets.FIREBASE_STORAGE_BUCKET }} \
+            --destination firmware/esp32/
+            
+          firebase storage:upload firmware_esp32s3_${{ needs.build-firmware.outputs.version }}.bin \
+            --bucket ${{ secrets.FIREBASE_STORAGE_BUCKET }} \
+            --destination firmware/esp32s3/
+            
+          # Upload metadata
+          firebase storage:upload ota_metadata.json \
+            --bucket ${{ secrets.FIREBASE_STORAGE_BUCKET }} \
+            --destination ota/latest.json
+            
+      - name: Update Realtime Database
+        run: |
+          # Update latest version info
+          firebase database:update /ota/latest \
+            --data '{
+              "version": "${{ needs.build-firmware.outputs.version }}",
+              "build_date": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'",
+              "download_url": "https://github.com/${{ github.repository }}/releases/download/v${{ needs.build-firmware.outputs.version }}/",
+              "mandatory": false,
+              "min_app_version": "1.0.0"
+            }' \
+            --project ${{ secrets.FIREBASE_PROJECT_ID }}
+
+  notify-devices:
+    name: Notify Devices
+    runs-on: ubuntu-latest
+    needs: [build-firmware, update-ota-server]
+    
+    steps:
+      - name: Send MQTT notification
+        run: |
+          # MQTT ile tüm cihazlara güncelleme bildirimi gönder
+          docker run --rm efrecon/mqtt-client \
+            pub -h ${{ secrets.MQTT_BROKER_HOST }} \
+            -u ${{ secrets.MQTT_USERNAME }} \
+            -P ${{ secrets.MQTT_PASSWORD }} \
+            -t "ota/update_available" \
+            -m '{
+              "version": "${{ needs.build-firmware.outputs.version }}",
+              "mandatory": false,
+              "download_url": "https://github.com/${{ github.repository }}/releases/download/v${{ needs.build-firmware.outputs.version }}/",
+              "checksum_esp32": "'$(jq -r '.firmwares.esp32.checksum' ota_metadata.json)'",
+              "checksum_esp32s3": "'$(jq -r '.firmwares.esp32s3.checksum' ota_metadata.json)'"
+            }'
+            
+      - name: Slack notification
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: |
+            🚀 Firmware v${{ needs.build-firmware.outputs.version }} released!
+            
+            📁 ESP32: firmware_esp32_${{ needs.build-firmware.outputs.version }}.bin
+            📁 ESP32-S3: firmware_esp32s3_${{ needs.build-firmware.outputs.version }}.bin
+            
+            🔗 Release: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.build-firmware.outputs.version }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }} 
